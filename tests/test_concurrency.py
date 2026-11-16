@@ -166,6 +166,98 @@ def test_two_servers_publish_single_consistent_version(tmp_path):
 
 
 @pytest.mark.slow
+def test_slow_download_does_not_block_wal_checkpoint_or_writes(tmp_path):
+    """A client paused at the header must not pin the WAL snapshot.
+
+    Instance A streams a large CSV; the client reads only the status line and
+    headers (``http.client`` does not read ahead) and then stalls.  Instance B
+    must still be able to upload hotspots and publish a computation, and a WAL
+    checkpoint must succeed and truncate the log while the client is stalled.
+    """
+
+    import http.client
+    import sqlite3
+
+    db_path = tmp_path / "forest.db"
+    port_a, port_b = free_port(), free_port()
+    server_a = Server(db_path, port_a, tmp_path)
+    server_b = Server(db_path, port_b, tmp_path)
+    server_a.wait_ready()
+    server_b.wait_ready()
+    try:
+        hotspot_rows = 80000
+        buf = ["hotspot_no,lon,lat,observed_at"]
+        buf += [f"H{i:05d},0.5,0.5,2026-01-01T00:00:00Z" for i in range(hotspot_rows)]
+        hotspot_csv = ("\n".join(buf) + "\n").encode()
+
+        with httpx.Client(base_url=server_a.base, timeout=30) as writer:
+            upload_map(writer, "v1.geojson", (SAMPLES / "compartments_v1.geojson").read_bytes())
+            upload_hotspots(writer, hotspot_csv)
+            wait_published(writer, 1, timeout=60)
+
+        # Pause a download after the response headers only.
+        paused = http.client.HTTPConnection("127.0.0.1", port_a, timeout=60)
+        paused.request("GET", "/batches/1/download.csv")
+        response = paused.getresponse()
+        assert response.status == 200
+        assert response.getheader("content-type").startswith("text/csv")
+        assert response.getheader("content-disposition").startswith("attachment")
+        assert response.read(0) == b""  # make sure http.client did not consume the body
+
+        with httpx.Client(base_url=server_b.base, timeout=60) as other:
+            # Writes and publication continue while the download is paused.
+            upload_map(other, "v2.geojson", (SAMPLES / "compartments_v2.geojson").read_bytes())
+            response = other.post(f"{other.base_url}/batches/1/recompute", follow_redirects=False)
+            assert response.status_code == 303
+            deadline = time.time() + 60
+            while time.time() < deadline:
+                payload = other.get(f"{other.base_url}/api/batches/1").json()
+                if payload["published_map_version"] == 2 and not payload["pending"]:
+                    break
+                time.sleep(0.1)
+            else:
+                raise AssertionError("recompute did not publish while a download was paused")
+            assert payload["published_total"] == hotspot_rows
+
+        wal_path = tmp_path / "forest.db-wal"
+        wal_before = wal_path.stat().st_size if wal_path.exists() else 0
+        assert wal_before < 16 * 1024 * 1024, wal_before
+
+        # No open read snapshot: the WAL can be checkpointed and truncated.
+        with sqlite3.connect(str(db_path), timeout=30) as conn:
+            busy, log_frames, checkpointed = conn.execute(
+                "PRAGMA wal_checkpoint(TRUNCATE)"
+            ).fetchone()
+        assert busy == 0, (busy, log_frames, checkpointed)
+        assert (wal_path.stat().st_size if wal_path.exists() else 0) == 0
+
+        # Abruptly drop the paused download; the server must release it and
+        # keep serving further requests normally.
+        paused.close()
+
+        with httpx.Client(base_url=server_a.base, timeout=30) as client:
+            deadline = time.time() + 30
+            while time.time() < deadline:
+                download = client.get(f"{client.base_url}/batches/1/download.csv")
+                if download.status_code == 200:
+                    break
+                time.sleep(0.2)
+            assert download.status_code == 200
+            text = download.content.decode("utf-8-sig")
+            lines = text.splitlines()
+            assert len(lines) == hotspot_rows + 1
+            assert "run-2" in lines[1]
+            assert "run-1" not in text
+
+        with sqlite3.connect(str(db_path), timeout=30) as conn:
+            busy, _, _ = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        assert busy == 0
+    finally:
+        server_a.stop()
+        server_b.stop()
+
+
+@pytest.mark.slow
 def test_concurrent_map_swaps_leave_exactly_one_active(tmp_path):
     db_path = tmp_path / "forest.db"
     port_a, port_b = free_port(), free_port()

@@ -15,6 +15,9 @@ Consistency model
   previous downloadable detail survives.
 * Downloads resolve ``published_run_id`` once and then read only that run's
   result rows, so a concurrent republication cannot produce a mixed file.
+  Rows are fetched page by page, each page in its own short read transaction
+  that is closed before the page is yielded; a paused or disconnected client
+  therefore never holds a WAL snapshot open (see ``iter_result_csv``).
 """
 
 from __future__ import annotations
@@ -766,8 +769,63 @@ def is_run_active(conn: sqlite3.Connection, batch_id: int) -> bool:
 # --------------------------------------------------------------------------
 
 
-def iter_result_csv(db_path: str, batch_id: int, chunk: int = 1000) -> Iterator[str]:
-    """Yield the published detail as CSV, pinned to one published run."""
+def _read_result_page(
+    db_path: str, batch_id: int, run_id: int, after_seq: int, limit: int
+) -> list[sqlite3.Row]:
+    """Read one page of a published run in a short, self-contained snapshot.
+
+    The read transaction is finished before the caller yields anything to the
+    HTTP client.  A client that stops reading therefore cannot pin the WAL:
+    the next page simply is not fetched until the client asks for it.
+    """
+
+    with db.connection(db_path) as conn:
+        with db.read_tx(conn):
+            return conn.execute(
+                """
+                SELECT r.hotspot_seq,
+                       h.source_row, h.hotspot_no, h.lon, h.lat, h.observed_at_utc,
+                       r.status, r.reason_kind, r.reason, r.codes_json,
+                       b.filename AS batch_filename, b.id AS batch_id,
+                       m.filename AS map_filename, m.id AS map_id, rr.id AS run_id
+                FROM results r
+                JOIN runs rr ON rr.id = r.run_id AND rr.batch_id = ?
+                JOIN hotspots h ON h.batch_id = rr.batch_id AND h.seq = r.hotspot_seq
+                JOIN batches b ON b.id = rr.batch_id
+                JOIN map_versions m ON m.id = rr.map_version_id
+                WHERE r.run_id = ? AND r.hotspot_seq > ?
+                ORDER BY r.hotspot_seq
+                LIMIT ?
+                """,
+                (batch_id, run_id, after_seq, limit),
+            ).fetchall()
+
+
+def iter_result_csv(
+    db_path: str, batch_id: int, run_id: int | None = None, chunk: int = 1000
+) -> Iterator[str]:
+    """Yield the published detail as CSV, pinned to one published run.
+
+    ``run_id`` is resolved by the caller once (the download route does this
+    before setting the filename) and every page below reads only that run's
+    rows plus the run's own map version.  Published result rows are immutable,
+    so reading page by page without one long-lived SQLite transaction cannot
+    mix runs or map versions.
+
+    Each page is fetched in its own short read transaction, and nothing is
+    yielded while that transaction is open.  That keeps the export's memory
+    bounded by ``chunk`` and, crucially, lets SQLite checkpoint the WAL while
+    a slow or disconnected client is paused mid-download.
+    """
+
+    if run_id is None:
+        with db.connection(db_path) as conn:
+            batch = conn.execute("SELECT * FROM batches WHERE id = ?", (batch_id,)).fetchone()
+            if batch is None:
+                raise ServiceError("热点批次不存在")
+            run_id = batch["published_run_id"]
+            if run_id is None:
+                raise ServiceError("该批次还没有可下载的计算结果")
 
     buffer = io.StringIO()
     writer = csv.writer(buffer, lineterminator="\r\n")
@@ -779,65 +837,42 @@ def iter_result_csv(db_path: str, batch_id: int, chunk: int = 1000) -> Iterator[
         return value
 
     with db.connection(db_path) as conn:
-        with db.read_tx(conn):
-            batch = conn.execute("SELECT * FROM batches WHERE id = ?", (batch_id,)).fetchone()
-            if batch is None:
-                raise ServiceError("热点批次不存在")
-            run_id = batch["published_run_id"]
-            if run_id is None:
-                raise ServiceError("该批次还没有可下载的计算结果")
-            run = conn.execute(
-                """
-                SELECT r.*, m.filename AS map_filename, m.id AS map_id
-                FROM runs r JOIN map_versions m ON m.id = r.map_version_id
-                WHERE r.id = ?
-                """,
-                (run_id,),
-            ).fetchone()
-            if run is None:
-                raise ServiceError("已发布的计算结果不存在")
-            writer.writerow(RESULT_COLUMNS)
-            yield "﻿" + drain()
-            cursor = conn.execute(
-                """
-                SELECT h.source_row, h.hotspot_no, h.lon, h.lat, h.observed_at_utc,
-                       r.status, r.reason_kind, r.reason, r.codes_json,
-                       b.filename AS batch_filename, b.id AS batch_id,
-                       m.filename AS map_filename, m.id AS map_id, rr.id AS run_id
-                FROM results r
-                JOIN runs rr ON rr.id = r.run_id
-                JOIN hotspots h ON h.batch_id = rr.batch_id AND h.seq = r.hotspot_seq
-                JOIN batches b ON b.id = rr.batch_id
-                JOIN map_versions m ON m.id = rr.map_version_id
-                WHERE r.run_id = ?
-                ORDER BY h.seq
-                """,
-                (run_id,),
+        run = conn.execute(
+            "SELECT id, batch_id FROM runs WHERE id = ?", (int(run_id),)
+        ).fetchone()
+    if run is None or int(run["batch_id"]) != int(batch_id):
+        raise ServiceError("已发布的计算结果不存在")
+    run_id = int(run_id)
+
+    writer.writerow(RESULT_COLUMNS)
+    yield "﻿" + drain()
+
+    after_seq = -1
+    while True:
+        rows = _read_result_page(db_path, batch_id, run_id, after_seq, chunk)
+        if not rows:
+            break
+        for row in rows:
+            codes = db.load_codes(row["codes_json"])
+            matched = row["status"] == MATCHED and codes
+            writer.writerow(
+                [
+                    row["batch_filename"],
+                    row["source_row"],
+                    row["hotspot_no"],
+                    f"{row['lon']:.8f}".rstrip("0").rstrip("."),
+                    f"{row['lat']:.8f}".rstrip("0").rstrip("."),
+                    row["observed_at_utc"],
+                    STATUS_LABELS.get(row["status"], row["status"]),
+                    REASON_LABELS.get(row["reason_kind"], row["reason_kind"]),
+                    row["reason"],
+                    codes[0] if matched else "",
+                    ";".join(codes) if not matched else "",
+                    f"v{row['map_id']} · {row['map_filename']}",
+                    f"run-{row['run_id']}",
+                ]
             )
-            while True:
-                rows = cursor.fetchmany(chunk)
-                if not rows:
-                    break
-                for row in rows:
-                    codes = db.load_codes(row["codes_json"])
-                    matched = row["status"] == MATCHED and codes
-                    writer.writerow(
-                        [
-                            row["batch_filename"],
-                            row["source_row"],
-                            row["hotspot_no"],
-                            f"{row['lon']:.8f}".rstrip("0").rstrip("."),
-                            f"{row['lat']:.8f}".rstrip("0").rstrip("."),
-                            row["observed_at_utc"],
-                            STATUS_LABELS.get(row["status"], row["status"]),
-                            REASON_LABELS.get(row["reason_kind"], row["reason_kind"]),
-                            row["reason"],
-                            codes[0] if matched else "",
-                            ";".join(codes) if not matched else "",
-                            f"v{row['map_id']} · {row['map_filename']}",
-                            f"run-{row['run_id']}",
-                        ]
-                    )
-                yield drain()
-            if buffer.tell():
-                yield drain()
+        after_seq = int(rows[-1]["hotspot_seq"])
+        yield drain()
+    if buffer.tell():
+        yield drain()

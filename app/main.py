@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import logging
 import os
 import sqlite3
@@ -213,13 +214,25 @@ def create_app(db_path: str | None = None, start_worker: bool | None = None) -> 
             published = service.get_published_run(c, batch)
         if published is None:
             raise HTTPException(status_code=409, detail="该批次还没有可下载的计算结果")
-        name = f"hotspot_attribution_batch{batch_id}_run{published['id']}.csv"
+        # Resolve the published run exactly once, here, and pass it to the
+        # exporter: the file name and every row then come from this same run
+        # (and therefore the same map version), even if another instance
+        # publishes a newer run while the client is still downloading.
+        run_id = int(published["id"])
+        exporter = service.iter_result_csv(app.state.settings["db_path"], batch_id, run_id)
+        try:
+            # Resolve and validate the pinned run before any header is sent, so
+            # a missing run is still a clean 409 instead of a truncated 200.
+            header = next(exporter)
+        except service.ServiceError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from None
+        name = f"hotspot_attribution_batch{batch_id}_run{run_id}.csv"
         headers = {
             "Content-Disposition": f"attachment; filename=\"{name}\"; filename*=UTF-8''{quote(name)}",
             "Cache-Control": "no-store",
         }
         return StreamingResponse(
-            service.iter_result_csv(app.state.settings["db_path"], batch_id),
+            itertools.chain([header], exporter),
             media_type="text/csv; charset=utf-8",
             headers=headers,
         )
